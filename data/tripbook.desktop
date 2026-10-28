@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Tripbook
+GenericName=Vehicle trip logbook
+Comment=Download GPS tracker trips and keep a business/private mileage logbook
+Exec=tripbook
+Icon=tripbook
+Terminal=false
+Categories=Office;Finance;
+Keywords=logbook;mileage;gps;tracker;trips;

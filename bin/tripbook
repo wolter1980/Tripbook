@@ -1,0 +1,5 @@
+#!/bin/sh
+# Launcher for Tripbook (runs from the source checkout this script lives in).
+HERE="$(dirname "$(readlink -f "$0")")"
+export PYTHONPATH="$HERE/..${PYTHONPATH:+:$PYTHONPATH}"
+exec python3 -m tripbook "$@"
