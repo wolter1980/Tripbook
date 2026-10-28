@@ -8,13 +8,18 @@ from __future__ import annotations
 import glob
 import logging
 import os
-import select
-import termios
+import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+
+try:  # POSIX serial ports (Linux, macOS); Windows needs another implementation of SerialPort
+    import select
+    import termios
+except ImportError:
+    select = termios = None
 
 log = logging.getLogger("tripbook.device")
 
@@ -44,8 +49,8 @@ RSP_NACK = 0x84
 RSP_LOGIN_STATUS = 0xD1
 USERDATA_DELIMITER = 0xFA
 
-BAUDS = {4800: termios.B4800, 9600: termios.B9600, 19200: termios.B19200,
-         38400: termios.B38400, 57600: termios.B57600, 115200: termios.B115200}
+BAUDS = {b: getattr(termios, f"B{b}") for b in (4800, 9600, 19200, 38400, 57600, 115200)} if termios else {}
+SERIAL_SUPPORTED = termios is not None
 
 
 class DeviceError(Exception):
@@ -88,7 +93,10 @@ def _usb_attr(dev_dir: Path, name: str) -> str:
 
 def list_ports() -> list[PortInfo]:
     ports = []
-    for path in sorted(glob.glob("/dev/ttyACM*") + glob.glob("/dev/ttyUSB*")):
+    # Linux names, then macOS ones (USB ids are only read on Linux, from /sys).
+    patterns = ["/dev/ttyACM*", "/dev/ttyUSB*"] if sys.platform.startswith("linux") else \
+        ["/dev/cu.usbmodem*", "/dev/cu.usbserial*"]
+    for path in sorted(p for pattern in patterns for p in glob.glob(pattern)):
         dev = Path("/sys/class/tty") / os.path.basename(path) / "device"
         info = PortInfo(path)
         if dev.exists():
@@ -127,6 +135,9 @@ class SerialPort:
 
     def __init__(self, path: str, baud: int = 115200):
         self.path = path
+        if not SERIAL_SUPPORTED:
+            raise DeviceError("Downloading from the tracker is not supported on this operating system yet. "
+                              "Import a tracker dump (.bin) or GPX file instead.")
         try:
             self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         except PermissionError as e:

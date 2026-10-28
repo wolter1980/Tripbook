@@ -1,0 +1,21 @@
+name: Feature request
+description: Suggest an idea or improvement
+labels: [enhancement]
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: What would you like to do?
+      description: The task or problem, rather than a solution – e.g. "my tax office wants a report that …".
+    validations:
+      required: true
+  - type: textarea
+    id: idea
+    attributes:
+      label: How could Tripbook help?
+  - type: checkboxes
+    id: help
+    attributes:
+      label: Contributing
+      options:
+        - label: I'd like to work on this myself

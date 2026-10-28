@@ -1,3 +1,4 @@
+import os
 import tempfile
 import unittest
 from datetime import timedelta
@@ -32,6 +33,8 @@ class DecodeTests(unittest.TestCase):
         self.assertEqual(decode_log(bytes(range(256)) * 20), [])
 
 
+@unittest.skipUnless(D.SERIAL_SUPPORTED and hasattr(os, "openpty"),
+                     "the simulated tracker needs POSIX pseudo terminals")
 class DeviceTests(unittest.TestCase):
     def run_download(self, password=""):
         raw, truth = sample_log()
@@ -391,7 +394,7 @@ class UpdateTests(unittest.TestCase):
     def test_backup_is_a_plain_file_copy(self):
         # SQLite never opens the destination (its locks hang on network shares); odd names must work too.
         import_points(self.db, self.vid, self.pts, "device")
-        folder = Path(self.tmp.name) / "share #1?"
+        folder = Path(self.tmp.name) / ("share #1" if os.name == "nt" else "share #1?")  # "?" is invalid on Windows
         folder.mkdir()
         dest = folder / "copy #2.db"
         self.db.backup_to(dest)

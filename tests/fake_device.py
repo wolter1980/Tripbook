@@ -4,7 +4,6 @@ from __future__ import annotations
 import math
 import os
 import threading
-import tty
 from datetime import datetime, timedelta, timezone
 
 from tripbook import device as D
@@ -40,6 +39,7 @@ class FakeLogger(threading.Thread):
     def __init__(self, log_bytes: bytes, password: str = "", total_sectors: int = 100,
                  userdata=("01Jan2024", "45292.5", "CA 123-456"), nmea_noise: bool = True):
         super().__init__(daemon=True)
+        import tty  # POSIX only: the tracker tests are skipped on Windows
         self.master, self.slave = os.openpty()
         tty.setraw(self.master)
         self.path = os.ttyname(self.slave)

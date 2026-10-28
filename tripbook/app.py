@@ -9,8 +9,14 @@ from pathlib import Path
 
 
 def data_dir() -> Path:
-    base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share")
-    return Path(os.environ.get("TRIPBOOK_DATA") or base / "tripbook")
+    """Where the logbook lives: $TRIPBOOK_DATA, else the platform's usual place for application data."""
+    if os.environ.get("TRIPBOOK_DATA"):
+        return Path(os.environ["TRIPBOOK_DATA"])
+    if sys.platform == "win32":
+        return Path(os.environ.get("APPDATA") or Path.home() / "AppData" / "Roaming") / "Tripbook"
+    if sys.platform == "darwin":
+        return Path.home() / "Library" / "Application Support" / "Tripbook"
+    return Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "tripbook"
 
 
 def main() -> None:

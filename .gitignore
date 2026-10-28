@@ -2,3 +2,9 @@ __pycache__/
 *.pyc
 *.db
 *.bin
+
+# packaging and virtual environments
+build/
+dist/
+*.egg-info/
+.venv/

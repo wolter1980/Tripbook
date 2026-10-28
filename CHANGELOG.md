@@ -2,6 +2,13 @@
 
 ## 1.1.0 – 2026-10-28
 
+**Tripbook is now open source** under the GNU General Public License v3.0 or later, at
+https://github.com/wolter1980/Tripbook: documentation (user guide, architecture, tracker protocol),
+contributing guide, code of conduct, security policy, issue templates, tests on Linux, macOS and Windows,
+and a `pyproject.toml` so it installs with `pip` on any platform. Tripbook now starts on Windows (tracker
+download there is not supported yet) and finds the tracker on macOS, and keeps its data in each platform's
+usual folder.
+
 Brought in line with **Little LogBook Global 2.4.002** (Windows installer of 28 May 2024; release notes
 of 2.4.001) and its user guide.
 

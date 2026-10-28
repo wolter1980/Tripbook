@@ -27,6 +27,7 @@ from .exchange import (REPORT_LAYOUTS, distance_factor, export_trips_csv, import
                        read_gpx, report_html, reverse_geocode, summary, write_gpx, write_kml)
 from .mapview import DEFAULT_TILES, MapView
 
+PROJECT_URL = "https://github.com/wolter1980/Tripbook"
 BACKUP_TIMEOUT_S = 60  # a network share that takes longer is treated as unavailable
 PERIODS = ["This month", "Last month", "This financial year", "Last financial year", "Last 12 months",
            "All time", "Custom"]
@@ -438,8 +439,11 @@ class MainWindow(QMainWindow):
         h = self.menuBar().addMenu("&Help")
         h.addAction("About Tripbook").triggered.connect(lambda: QMessageBox.about(
             self, "About Tripbook",
-            f"<b>Tripbook {__version__}</b><p>Vehicle trip logbook for Linux. Downloads trips from SkyTraq-based "
-            "USB GPS trackers, marks them business or private and produces logbook reports.</p>"
+            f"<b>Tripbook {__version__}</b><p>Open-source vehicle trip logbook for the Little LogBook GPS "
+            "tracker: downloads trips, marks them business or private and produces logbook reports.</p>"
+            f'<p><a href="{PROJECT_URL}">{PROJECT_URL}</a></p>'
+            "<p>Free software under the GNU General Public License v3.0 or later, with ABSOLUTELY NO WARRANTY.</p>"
+            "<p>An independent project, not affiliated with or endorsed by Little LogBook.</p>"
             "<p>Map data © OpenStreetMap contributors.</p>"))
 
     def reload_vehicles(self) -> None:
