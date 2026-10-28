@@ -388,6 +388,19 @@ class UpdateTests(unittest.TestCase):
         self.assertEqual(again, names)
         self.assertEqual(len(calls), 2)  # the second lookup comes from the cache
 
+    def test_backup_is_a_plain_file_copy(self):
+        # SQLite never opens the destination (its locks hang on network shares); odd names must work too.
+        import_points(self.db, self.vid, self.pts, "device")
+        folder = Path(self.tmp.name) / "share #1?"
+        folder.mkdir()
+        dest = folder / "copy #2.db"
+        self.db.backup_to(dest)
+        self.assertEqual([p.name for p in folder.iterdir()], ["copy #2.db"])  # no .part or snapshot left
+        self.assertEqual(list(Path(self.tmp.name).glob(".snapshot-*")), [])
+        self.db.x("DELETE FROM trip")
+        self.db.restore_from(dest)
+        self.assertEqual(len(self.db.trips()), 2)
+
     def test_auto_backup_and_restore(self):
         folder = Path(self.tmp.name) / "backups"
         for i in range(4):

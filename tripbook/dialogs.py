@@ -9,10 +9,9 @@ from typing import Callable
 
 from PySide6.QtCore import QDate, QDateTime, QObject, Qt, QThread, QTimer, Signal
 from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QDateTimeEdit, QDialog,
-                               QDialogButtonBox, QHeaderView, QSplitter, QTableWidget, QTableWidgetItem,
-                               QWidget,
-                               QDoubleSpinBox, QFormLayout, QHBoxLayout, QLabel, QLineEdit, QMessageBox,
-                               QPlainTextEdit, QProgressBar, QPushButton, QSlider, QSpinBox, QVBoxLayout)
+                               QDialogButtonBox, QDoubleSpinBox, QFileDialog, QFormLayout, QHBoxLayout, QHeaderView,
+                               QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QProgressBar, QPushButton, QSlider,
+                               QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget)
 
 from . import device as D
 from .db import EXPENSE_CATEGORIES, Database, UnnamedSpot
@@ -407,6 +406,19 @@ class SettingsDialog(FormDialog):
         self.backup_keep.setRange(1, 100)
         self.backup_keep.setValue(int(db.setting("backup_keep", "5")))
         self.backup_keep.setSuffix(" backups")
+        self.default_backup_dir = data_dir / "backups"
+        self.backup_dir = QLineEdit(db.setting("backup_dir", ""))
+        self.backup_dir.setPlaceholderText(str(self.default_backup_dir))
+        self.backup_dir.setToolTip("Where the backup is written when Tripbook closes, e.g. a USB drive, a network "
+                                   "share or a synced cloud folder. Empty: the data folder.")
+        browse = QPushButton("Browse…")
+        browse.clicked.connect(self._pick_backup_dir)
+        default = QPushButton("Default")
+        default.clicked.connect(self.backup_dir.clear)
+        brow = QHBoxLayout()
+        brow.addWidget(self.backup_dir, 1)
+        brow.addWidget(browse)
+        brow.addWidget(default)
         self.geocode = QCheckBox("Look up street addresses for new trips (OpenStreetMap Nominatim)")
         self.geocode.setChecked(db.setting("auto_geocode", "0") == "1")
         info = QLabel(f"Data folder: {data_dir}")
@@ -414,9 +426,36 @@ class SettingsDialog(FormDialog):
         for label, w in [("Split trips after a stop of", self.stop), ("Distance unit", self.units),
                          ("Currency symbol", self.currency), ("Financial year starts in", self.year_start),
                          ("Default map", self.view), ("Custom map tile URL", self.tiles), ("", self.geocode),
-                         ("", self.backup), ("Keep the newest", self.backup_keep), ("", info)]:
+                         ("", self.backup), ("Keep the newest", self.backup_keep)]:
             self.form.addRow(label, w)
+        self.form.addRow("Backup folder", brow)
+        self.form.addRow("", info)
+        self.backup.toggled.connect(self.backup_keep.setEnabled)
+        self.backup.toggled.connect(self.backup_dir.setEnabled)
+        self.backup_keep.setEnabled(self.backup.isChecked())
+        self.backup_dir.setEnabled(self.backup.isChecked())
         self.db = db
+
+    def _pick_backup_dir(self) -> None:
+        start = self.backup_dir.text().strip() or str(self.default_backup_dir)
+        folder = QFileDialog.getExistingDirectory(self, "Backup folder", start)
+        if folder:
+            self.backup_dir.setText(folder)
+
+    def accept(self) -> None:
+        folder = self.backup_dir.text().strip()
+        if folder and self.backup.isChecked():
+            path = Path(folder).expanduser()
+            try:
+                path.mkdir(parents=True, exist_ok=True)
+                probe = path / ".tripbook-write-test"
+                probe.write_bytes(b"")
+                probe.unlink()
+            except OSError as e:
+                QMessageBox.warning(self, "Backup folder", f"Tripbook cannot write to {path}:\n{e.strerror or e}")
+                return
+            self.backup_dir.setText(str(path))
+        super().accept()
 
     def save(self) -> None:
         db = self.db
@@ -429,6 +468,7 @@ class SettingsDialog(FormDialog):
         db.set_setting("map_view", "Map" if view == "Custom" and not self.tiles.text().strip() else view)
         db.set_setting("auto_backup", "1" if self.backup.isChecked() else "0")
         db.set_setting("backup_keep", self.backup_keep.value())
+        db.set_setting("backup_dir", self.backup_dir.text().strip())
         db.set_setting("auto_geocode", "1" if self.geocode.isChecked() else "0")
 
 

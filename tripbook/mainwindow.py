@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import re
+import sqlite3
+import threading
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -10,14 +12,13 @@ from PySide6.QtCore import (QAbstractTableModel, QDate, QItemSelection, QItemSel
                             QSettings, Qt, QTimer)
 from PySide6.QtGui import QAction, QBrush, QColor, QKeySequence, QPageLayout, QPageSize, QTextDocument
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
-from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QFileDialog, QHBoxLayout,
-                               QHeaderView,
-                               QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton,
-                               QSplitter, QStyledItemDelegate, QTableView, QTableWidget, QTableWidgetItem,
-                               QTabWidget, QTextBrowser, QToolBar, QVBoxLayout, QWidget)
+from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDateEdit, QFileDialog,
+                               QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu,
+                               QMessageBox, QPushButton, QSplitter, QStyledItemDelegate, QTabWidget, QTableView,
+                               QTableWidget, QTableWidgetItem, QTextBrowser, QToolBar, QVBoxLayout, QWidget)
 
 from . import __version__
-from .db import PLACE_RADIUS_M, Database, Trip, from_iso, to_iso
+from .db import PLACE_RADIUS_M, Database, Trip, from_iso, install_file, to_iso
 from .decode import decode_log
 from .dialogs import (DeviceDialog, ExpenseDialog, Job, ManualTripDialog, MileageRateDialog, OdometerDialog,
                       ReminderDialog, RuleDialog, SettingsDialog, SplitDialog, SuggestPlacesDialog,
@@ -26,6 +27,7 @@ from .exchange import (REPORT_LAYOUTS, distance_factor, export_trips_csv, import
                        read_gpx, report_html, reverse_geocode, summary, write_gpx, write_kml)
 from .mapview import DEFAULT_TILES, MapView
 
+BACKUP_TIMEOUT_S = 60  # a network share that takes longer is treated as unavailable
 PERIODS = ["This month", "Last month", "This financial year", "Last financial year", "Last 12 months",
            "All time", "Custom"]
 
@@ -294,15 +296,84 @@ class MainWindow(QMainWindow):
             j.cancel()
             j.wait(3000)
         if self.db.setting("auto_backup", "1") == "1":
-            try:
-                self.db.auto_backup(self.backup_dir, int(self.db.setting("backup_keep", "5")))
-            except OSError as err:
-                QMessageBox.warning(self, "Backup", f"The automatic backup failed: {err}")
+            self.backup_on_exit()
         super().closeEvent(e)
 
     @property
-    def backup_dir(self) -> Path:
+    def default_backup_dir(self) -> Path:
         return self.data_dir / "backups"
+
+    @property
+    def backup_dir(self) -> Path:
+        """The backup folder chosen in the settings, else the one in the data folder."""
+        chosen = self.db.setting("backup_dir", "")
+        return Path(chosen).expanduser() if chosen else self.default_backup_dir
+
+    def backup_on_exit(self) -> Path | None:
+        """Back up into the chosen folder; when that is unavailable (drive unplugged, share offline), into the
+        data folder instead, so closing never leaves Tripbook without a fresh backup."""
+        keep = int(self.db.setting("backup_keep", "5"))
+        target = self.backup_dir
+        problem = ""
+        try:
+            snap = self.db.snapshot()
+        except (OSError, sqlite3.Error) as err:
+            QMessageBox.warning(self, "Backup", f"The automatic backup failed: {err}")
+            return None
+        try:
+            if target != self.default_backup_dir:
+                self.statusBar().showMessage(f"Backing up to {target}…")
+                try:
+                    # Folder checks and the copy run in the background: a dead network share must not hang
+                    # closing Tripbook. Never create the folder: it could be an empty mount point.
+                    return self.run_file_task(lambda: self._backup_into(target, keep, snap), BACKUP_TIMEOUT_S)
+                except TimeoutError:
+                    problem = f"The backup folder {target} did not respond within {BACKUP_TIMEOUT_S} seconds."
+                except OSError as err:
+                    problem = f"The backup could not be written to {target}: {err.strerror or err}."
+            try:
+                path = self.db.auto_backup(self.default_backup_dir, keep, snap)
+            except OSError as err:
+                failed = f"The backup into {self.default_backup_dir} failed: {err}"
+                QMessageBox.warning(self, "Backup", f"{problem}\n{failed}" if problem else failed)
+                return None
+            if problem:
+                QMessageBox.warning(self, "Backup", f"{problem}\nThe backup was written to {path} instead.")
+            return path
+        finally:
+            snap.unlink(missing_ok=True)
+
+    def _backup_into(self, folder: Path, keep: int, snap: Path) -> Path:
+        if not folder.is_dir():
+            raise FileNotFoundError(2, "the folder is not available", str(folder))
+        return self.db.auto_backup(folder, keep, snap)
+
+    def run_file_task(self, fn, timeout_s: float):
+        """Run file I/O in a background thread while the window stays responsive; TimeoutError when it takes
+        longer than timeout_s (the thread is left to finish or fail on its own), else fn's result or error."""
+        result: dict = {}
+
+        def work():
+            try:
+                result["value"] = fn()
+            except BaseException as e:  # noqa: BLE001 - re-raised in the GUI thread
+                result["error"] = e
+
+        t = threading.Thread(target=work, daemon=True)
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            t.start()
+            deadline = time.monotonic() + timeout_s
+            while t.is_alive() and time.monotonic() < deadline:
+                QApplication.processEvents()
+                t.join(0.05)
+        finally:
+            QApplication.restoreOverrideCursor()
+        if t.is_alive():
+            raise TimeoutError
+        if "error" in result:
+            raise result["error"]
+        return result.get("value")
 
     # -- toolbar / filters ----------------------------------------------------------
     def _build_toolbar(self) -> None:
@@ -886,19 +957,34 @@ class MainWindow(QMainWindow):
     def backup(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Back up database",
                                               str(Path.home() / f"tripbook-{date.today()}.db"), "SQLite (*.db)")
-        if path:
-            self.db.backup_to(Path(path))
-            self.statusBar().showMessage(f"Backed up to {path}", 8000)
+        if not path:
+            return
+        self.statusBar().showMessage(f"Backing up to {path}…")
+        snap = self.db.snapshot()
+        try:
+            self.run_file_task(lambda: install_file(snap, Path(path)), BACKUP_TIMEOUT_S)
+        except TimeoutError:
+            QMessageBox.warning(self, "Back up database", f"Writing {path} did not finish within "
+                                f"{BACKUP_TIMEOUT_S} seconds. Is the drive or network share still available?")
+            self.statusBar().clearMessage()
+            return
+        except OSError as err:
+            QMessageBox.warning(self, "Back up database", f"Could not write {path}:\n{err.strerror or err}")
+            self.statusBar().clearMessage()
+            return
+        finally:
+            snap.unlink(missing_ok=True)
+        self.statusBar().showMessage(f"Backed up to {path}", 8000)
 
     def restore(self) -> None:
         start = self.backup_dir if self.backup_dir.exists() else Path.home()
         path, _ = QFileDialog.getOpenFileName(self, "Restore from backup", str(start), "Tripbook backups (*.db)")
         if not path or QMessageBox.question(
                 self, "Restore", "Replace all current data with this backup? The current data is backed up to "
-                f"{self.backup_dir} first.") != QMessageBox.StandardButton.Yes:
+                f"{self.default_backup_dir} first.") != QMessageBox.StandardButton.Yes:
             return
         try:
-            self.db.auto_backup(self.backup_dir, max(int(self.db.setting("backup_keep", "5")), 1) + 1)
+            self.db.auto_backup(self.default_backup_dir, max(int(self.db.setting("backup_keep", "5")), 1) + 1)
             self.db.restore_from(Path(path))
         except (OSError, ValueError) as e:
             QMessageBox.warning(self, "Restore", str(e))

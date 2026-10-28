@@ -28,7 +28,8 @@ lets you mark them business or private, and produces logbook reports (PDF/CSV).
 - **Units**: everything is shown and entered in kilometres or miles, as chosen in the settings.
 - **Import**: raw tracker dumps, GPX files, and an existing Little LogBook database (`.db`), including
   its stored GPS tracks. **Export**: GPX, KML (Google Earth), CSV, database backup.
-- **Backups**: automatic backup when Tripbook closes (the newest 5 are kept, configurable) and restore.
+- **Backups**: automatic backup when Tripbook closes into a folder you choose (the newest 5 are kept,
+  configurable; falls back to the data folder when that folder is unavailable) and restore.
 
 ## Install / run
 

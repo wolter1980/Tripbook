@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from . import __version__
-from .db import PLACE_RADIUS_M, Database, Trip, to_iso
+from .db import PLACE_RADIUS_M, Database, Trip, read_only_uri, to_iso
 from .decode import Point, TripCandidate, decode_log, pack_points, split_trips
 
 USER_AGENT = f"Tripbook/{__version__} (Linux desktop trip logbook)"
@@ -181,7 +181,7 @@ def open_llb_database(path: Path) -> tuple[sqlite3.Connection, Path | None]:
     """Open a Little LogBook database read-only, decrypting it to a temporary copy when needed."""
     data = Path(path).read_bytes()
     if data.startswith(b"SQLite format 3\0"):
-        return sqlite3.connect(f"file:{path}?mode=ro", uri=True), None
+        return sqlite3.connect(read_only_uri(Path(path)), uri=True), None
     plain = decrypt_llb_database(data)
     if plain is None:
         raise ValueError("This file is not a Little LogBook database (or uses an unknown password).")
@@ -196,6 +196,9 @@ def import_littlelogbook_db(db: Database, path: Path) -> dict[str, int]:
     """Import vehicles, named places, rules, trips, expenses and odometer readings from Little LogBook."""
     src, tmp = open_llb_database(path)
     try:
+        if "odometer_start" in _cols(src, "vehicle"):
+            raise ValueError("This is a Tripbook backup, not a Little LogBook database: use File → Restore from "
+                             "backup… to load it.")
         return _import_llb(db, src)
     finally:
         src.close()

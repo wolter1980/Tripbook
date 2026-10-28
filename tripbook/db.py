@@ -1,7 +1,10 @@
 """SQLite storage for vehicles, trips, places, rules, expenses and reminders."""
 from __future__ import annotations
 
+import os
+import shutil
 import sqlite3
+import tempfile
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
@@ -192,6 +195,23 @@ class UnnamedSpot:
     @property
     def label(self) -> str:
         return max(self.labels, key=self.labels.get) if self.labels else _coord_label(self.lat, self.lon)
+
+
+def install_file(src: Path, dest: Path) -> None:
+    """Copy src to dest as plain file I/O (safe on network shares); dest only appears once complete."""
+    part = dest.with_name(dest.name + ".part")
+    try:
+        shutil.copyfile(src, part)
+        os.replace(part, dest)
+    except BaseException:
+        part.unlink(missing_ok=True)
+        raise
+
+
+def read_only_uri(path: Path) -> str:
+    """SQLite URI that reads a database without taking file locks (which hang on network shares). Only for
+    files nobody writes to meanwhile, such as backups."""
+    return f"{path.resolve().as_uri()}?mode=ro&immutable=1"
 
 
 def _coord_label(lat, lon) -> str:
@@ -585,25 +605,44 @@ class Database:
         return out
 
     # -- backups --------------------------------------------------------------------
-    def backup_to(self, path: Path) -> None:
+    # SQLite must never write onto a network share: its file locks hang on SMB/CIFS mounts. A backup is made
+    # in a local snapshot and then copied over as a plain file (see install_file).
+    def snapshot(self) -> Path:
+        """A consistent copy of the database in a local temporary file; the caller deletes it."""
         self.conn.commit()
-        dst = sqlite3.connect(path)
+        fd, tmp = tempfile.mkstemp(suffix=".db", prefix=".snapshot-", dir=self.path.parent)
+        os.close(fd)
+        dst = sqlite3.connect(tmp)
         with dst:
             self.conn.backup(dst)
         dst.close()
+        return Path(tmp)
 
-    def auto_backup(self, folder: Path, keep: int) -> Path:
-        """Write a timestamped backup into `folder` and delete the oldest beyond `keep`."""
-        folder.mkdir(parents=True, exist_ok=True)
-        path = folder / f"tripbook-{datetime.now():%Y%m%d-%H%M%S}.db"
-        self.backup_to(path)
-        for old in sorted(folder.glob("tripbook-*.db"))[:-max(1, keep)]:
-            old.unlink(missing_ok=True)
-        return path
+    def backup_to(self, path: Path) -> None:
+        snap = self.snapshot()
+        try:
+            install_file(snap, Path(path))
+        finally:
+            snap.unlink(missing_ok=True)
+
+    def auto_backup(self, folder: Path, keep: int, snapshot: Path | None = None) -> Path:
+        """Write a timestamped backup into `folder` and delete the oldest beyond `keep`.
+        With a ready `snapshot` this does plain file operations only, so it may run in another thread."""
+        snap = snapshot or self.snapshot()
+        try:
+            folder.mkdir(parents=True, exist_ok=True)
+            path = folder / f"tripbook-{datetime.now():%Y%m%d-%H%M%S}.db"
+            install_file(snap, path)
+            for old in sorted(folder.glob("tripbook-*.db"))[:-max(1, keep)]:
+                old.unlink(missing_ok=True)
+            return path
+        finally:
+            if snapshot is None:
+                snap.unlink(missing_ok=True)
 
     def restore_from(self, path: Path) -> None:
         """Replace the whole database with a backup (checked to be a Tripbook database first)."""
-        src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        src = sqlite3.connect(read_only_uri(Path(path)), uri=True)
         try:
             if not src.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='trip'").fetchone():
                 raise ValueError("This file is not a Tripbook database.")

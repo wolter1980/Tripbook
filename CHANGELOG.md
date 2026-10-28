@@ -34,8 +34,9 @@ From the Little LogBook user guide:
 - Odometer readings have a time, so a reading between two trips on the same day corrects only the later one.
 - Reminder kinds (service interval, licence renewal, custom) and a per-reminder advance notice in days
   and distance.
-- Automatic database backup when Tripbook closes, keeping the newest 5 (configurable), and File → Restore
-  from backup….
+- Automatic database backup when Tripbook closes, keeping the newest 5 (configurable), into a backup folder
+  of your choice (e.g. a USB drive or network share; when it is unavailable the backup goes to the data
+  folder with a warning), and File → Restore from backup….
 - Warning when the tracker memory is 80 % full.
 - Manual trips can't be combined with recorded trips (a manual trip has no GPS track).
 - The status bar also shows total driving time and the number of auto-marked trips.
@@ -51,6 +52,10 @@ Fixes:
 - The odometer of new trips could restart at the opening odometer: editing a vehicle saved today's date as
   the opening odometer date, which then overrode all later odometer readings. The opening odometer now
   always applies from the first trip, and the vehicle window no longer has that date field.
+- Backing up onto a network share (SMB/CIFS) froze Tripbook: SQLite's file locks hang there. Backups are
+  now made locally and copied over as a plain file in the background, with a 60-second limit; restoring
+  or importing from a share reads without locks. Importing a Tripbook backup as a Little LogBook
+  database now explains to use Restore instead.
 - Tables keep their selection when they refresh: e.g. the odometer readings of the selected vehicle no
   longer disappear after adding a reading.
 
