@@ -2,4 +2,11 @@
 # Launcher for Tripbook (runs from the source checkout this script lives in).
 HERE="$(dirname "$(readlink -f "$0")")"
 export PYTHONPATH="$HERE/..${PYTHONPATH:+:$PYTHONPATH}"
+# Added to the dialout group but not logged in again since? Then this session lacks the group and the
+# tracker port cannot be opened: start Tripbook with the group via sg (no password needed for members).
+if [ -z "$TRIPBOOK_SG" ] && ! id -nG | tr ' ' '\n' | grep -qx dialout \
+        && id -nG "$(id -un)" | tr ' ' '\n' | grep -qx dialout && command -v sg >/dev/null; then
+    export TRIPBOOK_SG=1
+    exec sg dialout -c 'exec python3 -m tripbook'
+fi
 exec python3 -m tripbook "$@"

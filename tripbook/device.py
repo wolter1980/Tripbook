@@ -103,6 +103,25 @@ def list_ports() -> list[PortInfo]:
 
 # --------------------------------------------------------------------------- raw serial port
 
+def _permission_hint(path: str) -> str:
+    """Explain why `path` cannot be opened: not in the port's group, or added but not logged in again."""
+    import grp
+    import pwd
+    try:
+        gid = os.stat(path).st_gid
+        group = grp.getgrgid(gid).gr_name
+        user = pwd.getpwuid(os.getuid()).pw_name
+        member = user in grp.getgrgid(gid).gr_mem or pwd.getpwuid(os.getuid()).pw_gid == gid
+    except (OSError, KeyError):
+        return f"No permission to open {path}."
+    if member and gid not in os.getgroups():
+        return (f"No permission to open {path}: you are in the '{group}' group, but this session started before "
+                f"you were added. Log out and back in (or restart), or start Tripbook with its launcher "
+                f"('tripbook'), which picks up the group by itself.")
+    return (f"No permission to open {path}. Add yourself to the '{group}' group (sudo usermod -aG {group} $USER) "
+            f"and log in again, or install the udev rule with './install.sh --udev'.")
+
+
 class SerialPort:
     """Minimal raw 8N1 serial port on top of termios (no pyserial needed)."""
 
@@ -111,8 +130,7 @@ class SerialPort:
         try:
             self.fd = os.open(path, os.O_RDWR | os.O_NOCTTY | os.O_NONBLOCK)
         except PermissionError as e:
-            raise DeviceError(f"No permission to open {path}. Add yourself to the 'dialout' group "
-                              f"(sudo usermod -aG dialout $USER) and log in again.") from e
+            raise DeviceError(_permission_hint(path)) from e
         except OSError as e:
             raise DeviceError(f"Cannot open {path}: {e.strerror}") from e
         self.set_baud(baud)

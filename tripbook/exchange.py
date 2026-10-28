@@ -1,20 +1,22 @@
-"""Imports (raw dumps, GPX, Little LogBook databases), exports (GPX, CSV, HTML report) and geocoding."""
+"""Imports (raw dumps, GPX, Little LogBook databases), exports (GPX, KML, CSV, HTML report) and geocoding."""
 from __future__ import annotations
 
 import csv
 import html
 import json
 import sqlite3
+import time
 import urllib.parse
 import urllib.request
 import xml.etree.ElementTree as ET
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
-from .db import Database, Trip, to_iso
+from . import __version__
+from .db import PLACE_RADIUS_M, Database, Trip, to_iso
 from .decode import Point, TripCandidate, decode_log, pack_points, split_trips
 
-USER_AGENT = "Tripbook/1.0 (Linux desktop trip logbook)"
+USER_AGENT = f"Tripbook/{__version__} (Linux desktop trip logbook)"
 
 
 def import_points(db: Database, vehicle_id: int, points: list[Point], source: str) -> int:
@@ -33,7 +35,7 @@ def import_raw_dump(db: Database, vehicle_id: int, path: Path) -> int:
     return import_points(db, vehicle_id, decode_log(Path(path).read_bytes()), "device")
 
 
-# --------------------------------------------------------------------------- GPX
+# --------------------------------------------------------------------------- GPX / KML
 
 def _parse_time(s: str) -> datetime:
     s = s.strip().replace("Z", "+00:00")
@@ -76,6 +78,34 @@ def write_gpx(path: Path, tracks: list[tuple[str, list[Point]]]) -> None:
 
 
 # --------------------------------------------------------------------------- Little LogBook database
+
+def write_kml(path: Path, tracks: list[tuple[str, str, list[Point]]]) -> None:
+    """Google Earth file with one folder per trip: (name, "#rrggbb" colour, points) -> track, start and end."""
+    ns = "http://www.opengis.net/kml/2.2"
+    kml = ET.Element("kml", xmlns=ns)
+    doc = ET.SubElement(kml, "Document")
+    ET.SubElement(doc, "name").text = "Tripbook trips"
+    for i, (name, color, pts) in enumerate(tracks):
+        rgb = color.lstrip("#")
+        style = ET.SubElement(doc, "Style", id=f"t{i}")
+        ls = ET.SubElement(style, "LineStyle")
+        ET.SubElement(ls, "color").text = f"ff{rgb[4:6]}{rgb[2:4]}{rgb[0:2]}"  # KML colours are aabbggrr
+        ET.SubElement(ls, "width").text = "4"
+        folder = ET.SubElement(doc, "Folder")
+        ET.SubElement(folder, "name").text = name
+        if len(pts) > 1:
+            pm = ET.SubElement(folder, "Placemark")
+            ET.SubElement(pm, "name").text = name
+            ET.SubElement(pm, "styleUrl").text = f"#t{i}"
+            line = ET.SubElement(pm, "LineString")
+            ET.SubElement(line, "tessellate").text = "1"
+            ET.SubElement(line, "coordinates").text = " ".join(f"{p.lon:.6f},{p.lat:.6f},{p.alt:.1f}" for p in pts)
+        for label, p in (("Start", pts[0]), ("End", pts[-1])) if pts else ():
+            pm = ET.SubElement(folder, "Placemark")
+            ET.SubElement(pm, "name").text = f"{label} {p.time.astimezone():%Y-%m-%d %H:%M}"
+            ET.SubElement(ET.SubElement(pm, "Point"), "coordinates").text = f"{p.lon:.6f},{p.lat:.6f},{p.alt:.1f}"
+    ET.ElementTree(kml).write(path, encoding="utf-8", xml_declaration=True)
+
 
 def _cols(conn: sqlite3.Connection, table: str) -> set[str]:
     try:
@@ -220,8 +250,8 @@ def _import_llb(db: Database, src: sqlite3.Connection) -> dict[str, int]:
             if ex:
                 place_map[r["GeoNameId"]] = ex[0]["id"]
                 continue
-            place_map[r["GeoNameId"]] = db.x("INSERT INTO place(name, lat, lon, radius_m) VALUES (?,?,?,50)",
-                                             (r["Description"], r["Latitude"], r["Longitude"]))
+            place_map[r["GeoNameId"]] = db.x("INSERT INTO place(name, lat, lon, radius_m) VALUES (?,?,?,?)",
+                                             (r["Description"], r["Latitude"], r["Longitude"], PLACE_RADIUS_M))
             stats["places"] += 1
 
     if _cols(src, "Rules"):
@@ -294,10 +324,11 @@ def _import_llb(db: Database, src: sqlite3.Connection) -> dict[str, int]:
             d = _llb_time(r["Date"])
             if not vid or reading <= 0 or not d:
                 continue
-            day = d.astimezone().date().isoformat()
-            if db.q("SELECT 1 FROM odometer WHERE vehicle_id=? AND date=? AND reading=?", (vid, day, reading)):
+            when = to_iso(d)
+            if db.q("SELECT 1 FROM odometer WHERE vehicle_id=? AND reading=? AND substr(date, 1, 10)=?",
+                    (vid, reading, when[:10])):
                 continue
-            db.x("INSERT INTO odometer(vehicle_id, date, reading) VALUES (?,?,?)", (vid, day, reading))
+            db.x("INSERT INTO odometer(vehicle_id, date, reading) VALUES (?,?,?)", (vid, when, reading))
             stats["odometer readings"] += 1
 
     db.apply_rules()
@@ -307,7 +338,8 @@ def _import_llb(db: Database, src: sqlite3.Connection) -> dict[str, int]:
 # --------------------------------------------------------------------------- reports
 
 def distance_factor(db: Database) -> tuple[float, str]:
-    return (1 / 1.609344, "mi") if db.use_miles else (1.0, "km")
+    """Multiply stored kilometres by the factor to display them in the user's unit."""
+    return db.to_unit(1.0), db.unit
 
 
 def _local(dt: datetime) -> datetime:
@@ -341,17 +373,41 @@ def summary(db: Database, trips: list[Trip], expenses: list[sqlite3.Row]) -> dic
         per_type[name] = per_type.get(name, 0) + t.distance_km
         if tt and tt["is_business"]:
             business += t.distance_km
+    claim = sum(t.distance_km * db.mileage_rate(t.vehicle_id, _local(t.start_time).date()) for t in trips
+                if (tt := types.get(t.trip_type_id)) and tt["is_business"])
     per_cat: dict[str, float] = {}
     for e in expenses:
         per_cat[e["category"]] = per_cat.get(e["category"], 0) + e["amount"]
     return {"trips": len(trips), "total_km": total, "business_km": business,
             "business_pct": (business / total * 100) if total else 0.0, "per_type": per_type,
             "expenses": per_cat, "expense_total": sum(per_cat.values()),
-            "fuel_l": sum(e["volume"] for e in expenses if e["category"] == "Fuel")}
+            "fuel_l": sum(e["volume"] for e in expenses if e["category"] == "Fuel"), "mileage_claim": claim}
+
+
+def monthly_summary(db: Database, trips: list[Trip]) -> list[dict]:
+    """Per calendar month: trip count, distances by business/other, and opening/closing odometer."""
+    types = {r["id"]: r for r in db.trip_types()}
+    months: dict[str, dict] = {}
+    for t in trips:
+        key = f"{_local(t.start_time):%Y-%m}"
+        m = months.setdefault(key, {"month": key, "trips": 0, "total_km": 0.0, "business_km": 0.0,
+                                    "unmarked": 0, "odo_start": t.odo_start, "odo_end": t.odo_end})
+        tt = types.get(t.trip_type_id)
+        m["trips"] += 1
+        m["total_km"] += t.distance_km
+        m["business_km"] += t.distance_km if tt and tt["is_business"] else 0.0
+        m["unmarked"] += tt is None
+        m["odo_start"] = min(m["odo_start"], t.odo_start)
+        m["odo_end"] = max(m["odo_end"], t.odo_end)
+    return [months[k] for k in sorted(months)]
+
+
+REPORT_LAYOUTS = {"detailed": "Summary and every trip", "monthly": "Summary and monthly totals",
+                  "both": "Summary, monthly totals and every trip"}
 
 
 def report_html(db: Database, vehicle: sqlite3.Row | None, trips: list[Trip], expenses: list[sqlite3.Row],
-                period: str) -> str:
+                period: str, layout: str = "detailed", show_expenses: bool = True) -> str:
     f, unit = distance_factor(db)
     cur = db.setting("currency", "")
     s = summary(db, trips, expenses)
@@ -369,7 +425,21 @@ def report_html(db: Database, vehicle: sqlite3.Row | None, trips: list[Trip], ex
                         f"<td class=n>{(v / s['total_km'] * 100 if s['total_km'] else 0):.1f}%</td></tr>"
                         for k, v in sorted(s["per_type"].items()))
     exp_rows = "".join(f"<tr><td>{esc(k)}</td><td class=n>{cur}{v:,.2f}</td></tr>"
-                       for k, v in sorted(s["expenses"].items()))
+                       for k, v in sorted(s["expenses"].items())) if show_expenses else ""
+    claim = (f"<p>Business mileage claim (at your mileage rates): <b>{cur}{s['mileage_claim']:,.2f}</b></p>"
+             if s["mileage_claim"] else "")
+    month_rows = "".join(
+        f"<tr><td>{m['month']}</td><td class=n>{m['trips']}</td><td class=n>{m['odo_start'] * f:,.0f}</td>"
+        f"<td class=n>{m['odo_end'] * f:,.0f}</td><td class=n>{m['total_km'] * f:,.1f}</td>"
+        f"<td class=n>{m['business_km'] * f:,.1f}</td><td class=n>{(m['total_km'] - m['business_km']) * f:,.1f}</td>"
+        f"<td class=n>{(m['business_km'] / m['total_km'] * 100 if m['total_km'] else 0):.1f}%</td>"
+        f"<td class=n>{m['unmarked'] or ''}</td></tr>" for m in monthly_summary(db, trips))
+    monthly = (f"<h2>Monthly totals</h2><table><tr><th>Month</th><th>Trips</th><th>Odo start</th><th>Odo end</th>"
+               f"<th>Total {unit}</th><th>Business {unit}</th><th>Other {unit}</th><th>Business use</th>"
+               f"<th>Unmarked</th></tr>{month_rows}</table>") if layout in ("monthly", "both") else ""
+    detail = (f"<h2>Trips</h2><table><tr><th>Date</th><th>Time</th><th>From</th><th>To</th><th>Odo start</th>"
+              f"<th>Odo end</th><th>{unit}</th><th>Type</th><th>Reason</th></tr>{''.join(rows)}</table>"
+              ) if layout in ("detailed", "both") else ""
     veh = ""
     if vehicle:
         veh = (f"<p>Registration: <b>{esc(vehicle['registration'])}</b> &nbsp; Make: {esc(vehicle['make'])} "
@@ -391,16 +461,51 @@ td.n {{ text-align: right; }}
 <table><tr><th>Trips</th><th>Total distance</th><th>Business distance</th><th>Business use</th></tr>
 <tr><td class=n>{s['trips']}</td><td class=n>{s['total_km'] * f:,.1f} {unit}</td>
 <td class=n>{s['business_km'] * f:,.1f} {unit}</td><td class=n>{s['business_pct']:.1f}%</td></tr></table>
-<table><tr><th>Trip type</th><th>Distance</th><th>Share</th></tr>{type_rows}</table>
+<table><tr><th>Trip type</th><th>Distance</th><th>Share</th></tr>{type_rows}</table>{claim}
 {f'<table><tr><th>Expense category</th><th>Amount</th></tr>{exp_rows}<tr><th>Total</th><th class=n>{cur}{s["expense_total"]:,.2f}</th></tr></table>' if exp_rows else ''}
-<h2>Trips</h2>
-<table><tr><th>Date</th><th>Time</th><th>From</th><th>To</th><th>Odo start</th><th>Odo end</th>
-<th>{unit}</th><th>Type</th><th>Reason</th></tr>{''.join(rows)}</table>
+{monthly}{detail}
 <p style="color:#777">Generated by Tripbook on {datetime.now():%Y-%m-%d %H:%M}</p>
 </body></html>"""
 
 
 # --------------------------------------------------------------------------- reverse geocoding
+
+PHOTON_URL = "https://photon.komoot.io/reverse"
+# OpenStreetMap feature keys that make good place names (businesses, schools, parks, …), not roads or postcodes.
+POI_KEYS = {"amenity", "shop", "office", "tourism", "leisure", "craft", "healthcare", "club", "sport", "building",
+            "historic", "man_made", "aeroway", "railway", "landuse"}
+
+
+def place_suggestions(db: Database, lat: float, lon: float, radius_km: float = 0.2) -> list[str]:
+    """Names for a location from OpenStreetMap, best first: nearby named features (Photon), then the street
+    address with its suburb (Nominatim), then nearby streets. Cached; callers must rate-limit to 1/s."""
+    key = f"suggest:{lat:.4f},{lon:.4f}"
+    r = db.conn.execute("SELECT address FROM geocode_cache WHERE key=?", (key,)).fetchone()
+    if r:
+        return json.loads(r[0])
+    url = PHOTON_URL + "?" + urllib.parse.urlencode({"lat": f"{lat:.6f}", "lon": f"{lon:.6f}", "limit": 15,
+                                                     "radius": radius_km, "lang": "en"})
+    with urllib.request.urlopen(urllib.request.Request(url, headers={"User-Agent": USER_AGENT}), timeout=15) as resp:
+        features = json.load(resp).get("features", [])
+    pois, houses, streets = [], [], []
+    for f in features:  # Photon sorts by distance
+        p = f.get("properties", {})
+        name = (p.get("name") or "").strip()
+        if name and p.get("osm_key") in POI_KEYS:
+            pois.append(name)
+        elif name and p.get("osm_key") == "highway":
+            streets.append(name)
+        elif p.get("street") and p.get("housenumber"):
+            houses.append(f"{p['housenumber']} {p['street']}")
+    time.sleep(1.1)  # Nominatim usage policy: max 1 request per second
+    try:
+        address = reverse_geocode(db, lat, lon)
+    except OSError:
+        address = ""
+    out = list(dict.fromkeys(x for x in pois + houses[:1] + [address] + streets if x))
+    db.x("INSERT OR REPLACE INTO geocode_cache(key, address) VALUES (?,?)", (key, json.dumps(out)))
+    return out
+
 
 def reverse_geocode(db: Database, lat: float, lon: float) -> str:
     """Street address for a coordinate via OpenStreetMap Nominatim (cached; callers must rate-limit to 1/s)."""

@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
@@ -32,7 +32,7 @@ CREATE TABLE IF NOT EXISTS place (
     name TEXT NOT NULL,
     lat REAL NOT NULL,
     lon REAL NOT NULL,
-    radius_m REAL NOT NULL DEFAULT 150,
+    radius_m REAL NOT NULL DEFAULT 400,
     address TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS trip (
@@ -62,7 +62,8 @@ CREATE TABLE IF NOT EXISTS rule (
     end_place_id INTEGER NOT NULL REFERENCES place(id) ON DELETE CASCADE,
     trip_type_id INTEGER NOT NULL REFERENCES trip_type(id) ON DELETE CASCADE,
     reverse INTEGER NOT NULL DEFAULT 1,
-    reason TEXT NOT NULL DEFAULT ''
+    reason TEXT NOT NULL DEFAULT '',
+    reverse_reason TEXT NOT NULL DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS expense (
     id INTEGER PRIMARY KEY,
@@ -82,13 +83,22 @@ CREATE TABLE IF NOT EXISTS reminder (
     due_odometer REAL,
     repeat_months INTEGER NOT NULL DEFAULT 0,
     repeat_km REAL NOT NULL DEFAULT 0,
-    done INTEGER NOT NULL DEFAULT 0
+    done INTEGER NOT NULL DEFAULT 0,
+    notice_days INTEGER NOT NULL DEFAULT 14,
+    notice_km REAL NOT NULL DEFAULT 500
 );
 CREATE TABLE IF NOT EXISTS odometer (
     id INTEGER PRIMARY KEY,
     vehicle_id INTEGER NOT NULL REFERENCES vehicle(id) ON DELETE CASCADE,
-    date TEXT NOT NULL,
+    date TEXT NOT NULL,  -- UTC ISO time of the reading (older rows: a plain YYYY-MM-DD date)
     reading REAL NOT NULL
+);
+CREATE TABLE IF NOT EXISTS mileage_rate (
+    id INTEGER PRIMARY KEY,
+    vehicle_id INTEGER REFERENCES vehicle(id) ON DELETE CASCADE,
+    from_date TEXT NOT NULL,
+    description TEXT NOT NULL DEFAULT '',
+    rate REAL NOT NULL DEFAULT 0  -- money per km, from from_date until the next rate
 );
 CREATE TABLE IF NOT EXISTS download (
     id INTEGER PRIMARY KEY,
@@ -108,6 +118,17 @@ CREATE TABLE IF NOT EXISTS setting (
 );
 """
 
+# Columns added after the first release: (table, column, declaration) for databases created before them.
+MIGRATIONS = [
+    ("rule", "reverse_reason", "TEXT NOT NULL DEFAULT ''"),
+    ("reminder", "notice_days", "INTEGER NOT NULL DEFAULT 14"),
+    ("reminder", "notice_km", "REAL NOT NULL DEFAULT 500"),
+]
+
+KM_PER_MILE = 1.609344
+# A trip end belongs to a place within this distance. Little LogBook matched up to about 400 m: a parked
+# car's first/last GPS fix often lies a few hundred metres from the spot that was named.
+PLACE_RADIUS_M = 400.0
 DEFAULT_TYPES = [("Business", "#2a7de1", 1), ("Private", "#e07b39", 0)]
 EXPENSE_CATEGORIES = ["Fuel", "Maintenance", "Tyres", "Insurance", "Licence", "Tolls", "Parking", "Finance", "Other"]
 
@@ -160,6 +181,19 @@ class Trip:
         return self.end_desc or _coord_label(self.end_lat, self.end_lon)
 
 
+@dataclass
+class UnnamedSpot:
+    """A location where trips start or end that has no place yet."""
+    lat: float
+    lon: float
+    ends: list[tuple[int, str]] = field(default_factory=list)  # (trip id, "start"/"end")
+    labels: dict[str, int] = field(default_factory=dict)  # text the trips show now (e.g. a suburb) -> count
+
+    @property
+    def label(self) -> str:
+        return max(self.labels, key=self.labels.get) if self.labels else _coord_label(self.lat, self.lon)
+
+
 def _coord_label(lat, lon) -> str:
     return f"{lat:.5f}, {lon:.5f}" if lat is not None and lon is not None else ""
 
@@ -177,6 +211,15 @@ class Database:
         self.conn.row_factory = sqlite3.Row
         self.conn.execute("PRAGMA foreign_keys = ON")
         self.conn.executescript(SCHEMA)
+        for table, col, decl in MIGRATIONS:
+            if col not in {r[1] for r in self.conn.execute(f"PRAGMA table_info({table})")}:
+                self.conn.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+        self.conn.commit()
+        if self.setting("place_radius_upgraded") != "1":
+            # Places made with the old radii (50 m on Little LogBook import, 150 m default) missed most visits.
+            self.conn.execute("UPDATE place SET radius_m=? WHERE radius_m IN (50, 150)", (PLACE_RADIUS_M,))
+            self.set_setting("place_radius_upgraded", "1")
+            self.resolve_places()
         if not self.conn.execute("SELECT 1 FROM trip_type").fetchone():
             self.conn.executemany("INSERT INTO trip_type(name, color, is_business) VALUES (?,?,?)", DEFAULT_TYPES)
         self.conn.commit()
@@ -205,6 +248,18 @@ class Database:
     @property
     def use_miles(self) -> bool:
         return self.setting("units", "km") == "mi"
+
+    @property
+    def unit(self) -> str:
+        return "mi" if self.use_miles else "km"
+
+    def to_unit(self, km: float) -> float:
+        """Kilometres (how everything is stored) to the distance unit the user chose."""
+        return km / KM_PER_MILE if self.use_miles else km
+
+    def from_unit(self, value: float) -> float:
+        """A distance typed in the user's unit back to kilometres."""
+        return value * KM_PER_MILE if self.use_miles else value
 
     # -- lookups --------------------------------------------------------------------
     def vehicles(self, include_closed: bool = True) -> list[sqlite3.Row]:
@@ -250,26 +305,28 @@ class Database:
         return unpack_points(r[0]) if r else []
 
     def _fill_odometers(self, trips: list[Trip]) -> None:
-        """Odometer = last known reading (or opening odometer) + GPS distance of all trips since then."""
+        """Odometer = last known reading (or opening odometer) + GPS distance of all trips since then.
+
+        The opening odometer is where the vehicle's logbook starts, so it applies from the first trip
+        whatever date it carries; only odometer readings are placed in time."""
         by_vehicle: dict[int, list[Trip]] = {}
         for t in trips:
             by_vehicle.setdefault(t.vehicle_id, []).append(t)
         for vid, vtrips in by_vehicle.items():
-            v = self.conn.execute("SELECT odometer_start, odometer_start_date FROM vehicle WHERE id=?",
-                                  (vid,)).fetchone()
+            v = self.conn.execute("SELECT odometer_start FROM vehicle WHERE id=?", (vid,)).fetchone()
             if not v:
                 continue
-            anchors = [(v["odometer_start_date"] or "0000", v["odometer_start"])]
-            anchors += [(r["date"], r["reading"]) for r in
-                        self.q("SELECT date, reading FROM odometer WHERE vehicle_id=? ORDER BY date", (vid,))]
-            anchors.sort()
+            # "" sorts before every date: a dated opening odometer must never override later readings.
+            anchors = [("", v["odometer_start"])] + sorted(
+                (r["date"], r["reading"]) for r in self.q("SELECT date, reading FROM odometer WHERE vehicle_id=?",
+                                                          (vid,)))
             all_trips = self.q("SELECT id, start_time, distance_km FROM trip WHERE vehicle_id=? ORDER BY start_time",
                                (vid,))
             odo_by_id: dict[int, float] = {}
             ai, base_date, odo = 0, anchors[0][0], anchors[0][1]
             for r in all_trips:
-                day = r["start_time"][:10]
-                while ai + 1 < len(anchors) and anchors[ai + 1][0] <= day:
+                # A date-only anchor sorts before every trip of that day, a timed one only before later trips.
+                while ai + 1 < len(anchors) and anchors[ai + 1][0] <= r["start_time"]:
                     ai += 1
                     base_date, odo = anchors[ai]
                 odo_by_id[r["id"]] = odo
@@ -329,6 +386,8 @@ class Database:
         idx = [all_ids.index(t.id) for t in trips]
         if idx != list(range(idx[0], idx[0] + len(idx))):
             raise ValueError("Only consecutive trips can be combined.")
+        if len({t.has_points for t in trips}) > 1:
+            raise ValueError("A manual trip has no GPS track, so it cannot be combined with recorded trips.")
         pts: list[Point] = []
         for t in trips:
             pts += self.trip_points(t.id)
@@ -343,6 +402,44 @@ class Database:
         self.conn.executemany("DELETE FROM trip WHERE id=?", [(t.id,) for t in trips[1:]])
         self.conn.commit()
         return first.id
+
+    def split_trip(self, trip_id: int, index: int) -> int:
+        """Split a recorded trip at track point `index` (shared by both halves); returns the new second trip."""
+        t = self.trip(trip_id)
+        pts = self.trip_points(trip_id)
+        if not 0 < index < len(pts) - 1:
+            raise ValueError("Choose a split point between the start and the end of the trip.")
+        a, b = TripCandidate(pts[:index + 1]), TripCandidate(pts[index:])
+        self.conn.execute(
+            "UPDATE trip SET end_time=?, end_lat=?, end_lon=?, end_place_id=NULL, end_desc='', distance_km=?, "
+            "duration_s=?, poi_count=?, points=? WHERE id=?",
+            (to_iso(a.end.time), a.end.lat, a.end.lon, round(a.distance_km, 3), a.duration_s,
+             sum(p.poi for p in a.points), pack_points(a.points), trip_id))
+        cur = self.conn.execute(
+            "INSERT INTO trip(vehicle_id, start_time, end_time, start_lat, start_lon, end_lat, end_lon, "
+            "end_place_id, end_desc, distance_km, duration_s, trip_type_id, reason, auto_marked, poi_count, points, "
+            "source) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            (t.vehicle_id, to_iso(b.start.time), to_iso(b.end.time), b.start.lat, b.start.lon, b.end.lat, b.end.lon,
+             t.end_place_id, t.end_desc, round(b.distance_km, 3), b.duration_s, t.trip_type_id, t.reason,
+             int(t.auto_marked), sum(p.poi for p in b.points[1:]), pack_points(b.points), t.source))
+        self.conn.commit()
+        self.resolve_places([trip_id, cur.lastrowid])
+        return cur.lastrowid
+
+    def reasons(self, limit: int = 100) -> list[str]:
+        """Previously used trip and rule reasons, most used first."""
+        return [r[0] for r in self.q(
+            "SELECT reason, COUNT(*) n FROM (SELECT reason FROM trip UNION ALL SELECT reason FROM rule "
+            "UNION ALL SELECT reverse_reason FROM rule) WHERE reason<>'' GROUP BY reason ORDER BY n DESC, reason "
+            "LIMIT ?", (limit,))]
+
+    # -- mileage rates --------------------------------------------------------------
+    def mileage_rate(self, vehicle_id: int, day: date) -> float:
+        """Rate per km on `day`: the latest rate starting on or before it, a vehicle's own rates first."""
+        r = self.conn.execute(
+            "SELECT rate FROM mileage_rate WHERE (vehicle_id=? OR vehicle_id IS NULL) AND from_date<=? "
+            "ORDER BY vehicle_id IS NULL, from_date DESC LIMIT 1", (vehicle_id, day.isoformat())).fetchone()
+        return r[0] if r else 0.0
 
     # -- places & auto-marking ------------------------------------------------------
     def nearest_place(self, lat: float | None, lon: float | None, places=None) -> sqlite3.Row | None:
@@ -377,6 +474,52 @@ class Database:
         self.conn.commit()
         self.apply_rules()
 
+    def name_place(self, lat: float, lon: float, name: str, place_id: int | None = None) -> int:
+        """Name the location at lat/lon for every trip: rename its place (the one a trip end is attached to,
+        else the nearest one in range) or create a new place, then relabel all trips."""
+        place = (self.q("SELECT * FROM place WHERE id=?", (place_id,)) or [None])[0] if place_id else None
+        place = place or self.nearest_place(lat, lon)
+        if place:
+            self.x("UPDATE place SET name=? WHERE id=?", (name, place["id"]))
+            pid = place["id"]
+        else:
+            pid = self.x("INSERT INTO place(name, lat, lon, radius_m, address) VALUES (?,?,?,?,?)",
+                         (name, lat, lon, PLACE_RADIUS_M, self.cached_address(lat, lon) or ""))
+        self.resolve_places()
+        return pid
+
+    def create_places(self, places: list[tuple[str, float, float]]) -> None:
+        """Add several (name, lat, lon) places at once and relabel all trips."""
+        self.conn.executemany("INSERT INTO place(name, lat, lon, radius_m) VALUES (?,?,?,?)",
+                              [(n, la, lo, PLACE_RADIUS_M) for n, la, lo in places])
+        self.conn.commit()
+        self.resolve_places()
+
+    def unnamed_spots(self, include_described: bool = False) -> list[UnnamedSpot]:
+        """Trip ends that belong to no place, grouped into spots of PLACE_RADIUS_M, most visited first.
+        Without `include_described` only ends that show bare coordinates are considered."""
+        ends = []
+        for r in self.q("SELECT id, start_lat, start_lon, end_lat, end_lon, start_place_id, end_place_id, "
+                        "start_desc, end_desc FROM trip WHERE start_lat IS NOT NULL"):
+            for which in ("start", "end"):
+                lat, desc = r[f"{which}_lat"], r[f"{which}_desc"]
+                if lat is not None and r[f"{which}_place_id"] is None and (include_described or not desc):
+                    ends.append((lat, r[f"{which}_lon"], r["id"], which, desc))
+        # Seed spots from the densest points so a spot is centred where the car usually stops.
+        density = {i: sum(haversine_m(a[0], a[1], b[0], b[1]) <= PLACE_RADIUS_M / 2 for b in ends)
+                   for i, a in enumerate(ends)} if len(ends) <= 3000 else {}
+        spots: list[UnnamedSpot] = []
+        for i in sorted(range(len(ends)), key=lambda i: -density.get(i, 0)):
+            lat, lon, tid, which, desc = ends[i]
+            spot = next((s for s in spots if haversine_m(lat, lon, s.lat, s.lon) <= PLACE_RADIUS_M), None)
+            if spot is None:
+                spot = UnnamedSpot(lat, lon)
+                spots.append(spot)
+            spot.ends.append((tid, which))
+            if desc:
+                spot.labels[desc] = spot.labels.get(desc, 0) + 1
+        return sorted(spots, key=lambda s: -len(s.ends))
+
     def delete_places(self, ids: list[int]) -> None:
         for pid in ids:
             self.conn.execute("UPDATE trip SET start_desc='' WHERE start_place_id=?", (pid,))
@@ -399,10 +542,11 @@ class Database:
                 rev = r["reverse"] and (r["end_place_id"], r["start_place_id"]) == (t["start_place_id"],
                                                                                     t["end_place_id"])
                 if fwd or rev:
+                    reason = r["reason"] if fwd else (r["reverse_reason"] or r["reason"])
                     self.conn.execute(
                         "UPDATE trip SET trip_type_id=?, auto_marked=1, "
                         "reason=CASE WHEN reason='' THEN ? ELSE reason END WHERE id=?",
-                        (r["trip_type_id"], r["reason"], t["id"]))
+                        (r["trip_type_id"], reason, t["id"]))
                     changed += 1
                     break
         self.conn.commit()
@@ -417,7 +561,8 @@ class Database:
         self.x("INSERT OR REPLACE INTO geocode_cache(key, address) VALUES (?,?)", (f"{lat:.4f},{lon:.4f}", address))
 
     # -- reminders ------------------------------------------------------------------
-    def due_reminders(self, soon_days: int = 14, soon_km: float = 500) -> list[tuple[sqlite3.Row, str]]:
+    def due_reminders(self) -> list[tuple[sqlite3.Row, str]]:
+        """(reminder, status) pairs; status is "overdue", "due soon" (within the reminder's notice) or ""."""
         out = []
         today = date.today()
         odo_cache: dict[int, float] = {}
@@ -428,16 +573,47 @@ class Database:
                 d = date.fromisoformat(r["due_date"])
                 if d < today:
                     status = "overdue"
-                elif d <= today + timedelta(days=soon_days):
+                elif d <= today + timedelta(days=r["notice_days"]):
                     status = "due soon"
             if r["due_odometer"]:
                 odo = odo_cache.setdefault(r["vehicle_id"], self.current_odometer(r["vehicle_id"]))
                 if odo >= r["due_odometer"]:
                     status = "overdue"
-                elif odo >= r["due_odometer"] - soon_km and not status:
+                elif odo >= r["due_odometer"] - r["notice_km"] and not status:
                     status = "due soon"
             out.append((r, status))
         return out
+
+    # -- backups --------------------------------------------------------------------
+    def backup_to(self, path: Path) -> None:
+        self.conn.commit()
+        dst = sqlite3.connect(path)
+        with dst:
+            self.conn.backup(dst)
+        dst.close()
+
+    def auto_backup(self, folder: Path, keep: int) -> Path:
+        """Write a timestamped backup into `folder` and delete the oldest beyond `keep`."""
+        folder.mkdir(parents=True, exist_ok=True)
+        path = folder / f"tripbook-{datetime.now():%Y%m%d-%H%M%S}.db"
+        self.backup_to(path)
+        for old in sorted(folder.glob("tripbook-*.db"))[:-max(1, keep)]:
+            old.unlink(missing_ok=True)
+        return path
+
+    def restore_from(self, path: Path) -> None:
+        """Replace the whole database with a backup (checked to be a Tripbook database first)."""
+        src = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+        try:
+            if not src.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='trip'").fetchone():
+                raise ValueError("This file is not a Tripbook database.")
+            src.backup(self.conn)
+        except sqlite3.DatabaseError as e:
+            raise ValueError(f"This file is not a Tripbook database ({e}).") from None
+        finally:
+            src.close()
+        self.conn.close()
+        self.__init__(self.path)  # re-apply schema migrations to an older backup
 
     def complete_reminder(self, rid: int) -> None:
         r = self.q("SELECT * FROM reminder WHERE id=?", (rid,))[0]

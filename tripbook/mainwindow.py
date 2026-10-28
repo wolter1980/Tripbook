@@ -2,27 +2,28 @@
 from __future__ import annotations
 
 import re
-import sqlite3
 import time
 from datetime import date, datetime, timedelta
 from pathlib import Path
 
 from PySide6.QtCore import (QAbstractTableModel, QDate, QItemSelection, QItemSelectionModel, QModelIndex,
-                            QSettings, Qt)
+                            QSettings, Qt, QTimer)
 from PySide6.QtGui import QAction, QBrush, QColor, QKeySequence, QPageLayout, QPageSize, QTextDocument
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
-from PySide6.QtWidgets import (QAbstractItemView, QComboBox, QDateEdit, QFileDialog, QHBoxLayout, QHeaderView,
+from PySide6.QtWidgets import (QAbstractItemView, QCheckBox, QComboBox, QDateEdit, QFileDialog, QHBoxLayout,
+                               QHeaderView,
                                QInputDialog, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox, QPushButton,
                                QSplitter, QStyledItemDelegate, QTableView, QTableWidget, QTableWidgetItem,
                                QTabWidget, QTextBrowser, QToolBar, QVBoxLayout, QWidget)
 
 from . import __version__
-from .db import Database, Trip
+from .db import PLACE_RADIUS_M, Database, Trip, from_iso, to_iso
 from .decode import decode_log
-from .dialogs import (DeviceDialog, ExpenseDialog, Job, ManualTripDialog, ReminderDialog, RuleDialog,
-                      SettingsDialog, VehicleDialog)
-from .exchange import (distance_factor, export_trips_csv, import_littlelogbook_db, import_points, read_gpx,
-                       report_html, reverse_geocode, summary, write_gpx)
+from .dialogs import (DeviceDialog, ExpenseDialog, Job, ManualTripDialog, MileageRateDialog, OdometerDialog,
+                      ReminderDialog, RuleDialog, SettingsDialog, SplitDialog, SuggestPlacesDialog,
+                      VehicleDialog)
+from .exchange import (REPORT_LAYOUTS, distance_factor, export_trips_csv, import_littlelogbook_db, import_points,
+                       read_gpx, report_html, reverse_geocode, summary, write_gpx, write_kml)
 from .mapview import DEFAULT_TILES, MapView
 
 PERIODS = ["This month", "Last month", "This financial year", "Last financial year", "Last 12 months",
@@ -144,8 +145,15 @@ class TripModel(QAbstractTableModel):
             t.reason = str(value).strip()
         elif col in ("From", "To"):
             key = "start_desc" if col == "From" else "end_desc"
-            db.update_trip(t.id, **{key: str(value).strip()})
-            setattr(t, key, str(value).strip())
+            text = str(value).strip()
+            lat, lon = (t.start_lat, t.start_lon) if col == "From" else (t.end_lat, t.end_lon)
+            if text and lat is not None:
+                # Like the original: naming a trip's start or end names that location for all trips.
+                db.name_place(lat, lon, text, t.start_place_id if col == "From" else t.end_place_id)
+                QTimer.singleShot(0, self.win.refresh_trips)  # not while the view is still committing the edit
+                return True
+            db.update_trip(t.id, **{key: text})
+            setattr(t, key, text)
         self.dataChanged.emit(index, index)
         self.win.update_status()
         return True
@@ -213,6 +221,10 @@ def table_widget(headers: list[str]) -> QTableWidget:
 
 
 def fill_table(t: QTableWidget, rows: list[list], ids: list[int]) -> None:
+    """Replace the table contents, keeping the rows that were selected (by id) selected."""
+    keep = set(selected_ids(t)) if t.rowCount() else set()
+    was_blocked = t.blockSignals(True)
+    t.selectionModel().blockSignals(True)
     t.setSortingEnabled(False)  # inserting while sorted would scramble rows
     t.setRowCount(0)
     for r, (vals, rid) in enumerate(zip(rows, ids)):
@@ -224,6 +236,13 @@ def fill_table(t: QTableWidget, rows: list[list], ids: list[int]) -> None:
             t.setItem(r, c, item)
     t.setSortingEnabled(True)
     t.resizeColumnsToContents()
+    sel = QItemSelection()
+    for r in range(t.rowCount()):
+        if t.item(r, 0).data(Qt.ItemDataRole.UserRole) in keep:
+            sel.select(t.model().index(r, 0), t.model().index(r, t.columnCount() - 1))
+    t.selectionModel().select(sel, QItemSelectionModel.SelectionFlag.ClearAndSelect)
+    t.selectionModel().blockSignals(False)
+    t.blockSignals(was_blocked)
 
 
 def selected_ids(t: QTableWidget) -> list[int]:
@@ -274,7 +293,16 @@ class MainWindow(QMainWindow):
         for j in self.jobs:
             j.cancel()
             j.wait(3000)
+        if self.db.setting("auto_backup", "1") == "1":
+            try:
+                self.db.auto_backup(self.backup_dir, int(self.db.setting("backup_keep", "5")))
+            except OSError as err:
+                QMessageBox.warning(self, "Backup", f"The automatic backup failed: {err}")
         super().closeEvent(e)
+
+    @property
+    def backup_dir(self) -> Path:
+        return self.data_dir / "backups"
 
     # -- toolbar / filters ----------------------------------------------------------
     def _build_toolbar(self) -> None:
@@ -325,8 +353,11 @@ class MainWindow(QMainWindow):
         m = self.menuBar().addMenu("&File")
         for text, fn in [("Import tracker dump (.bin)…", self.import_dump), ("Import GPX…", self.import_gpx),
                          ("Import Little LogBook database…", self.import_llb), (None, None),
-                         ("Export selected trips as GPX…", self.export_gpx), ("Export trips as CSV…", self.export_csv),
-                         (None, None), ("Back up database…", self.backup), (None, None),
+                         ("Export selected trips as GPX…", self.export_gpx),
+                         ("Export selected trips as KML (Google Earth)…", self.export_kml),
+                         ("Export trips as CSV…", self.export_csv),
+                         (None, None), ("Back up database…", self.backup), ("Restore from backup…", self.restore),
+                         (None, None),
                          ("Settings…", self.open_settings), ("Quit", self.close)]:
             if text is None:
                 m.addSeparator()
@@ -417,12 +448,20 @@ class MainWindow(QMainWindow):
         s = summary(self.db, trips, [])
         f, unit = distance_factor(self.db)
         unmarked = sum(1 for t in trips if t.trip_type_id is None)
+        auto = sum(1 for t in trips if t.auto_marked)
+        hours = sum(t.duration_s for t in trips) / 3600
         self.status_label.setText(
-            f"{s['trips']} trips · {s['total_km'] * f:,.1f} {unit} · business {s['business_km'] * f:,.1f} {unit} "
-            f"({s['business_pct']:.0f}%)" + (f" · {unmarked} unmarked" if unmarked else ""))
+            f"{s['trips']} trips · {s['total_km'] * f:,.1f} {unit} · {hours:,.1f} h · business "
+            f"{s['business_km'] * f:,.1f} {unit} ({s['business_pct']:.0f}%)"
+            + (f" · {unmarked} unmarked" if unmarked else "") + (f" · {auto} auto-marked" if auto else ""))
 
     def tiles(self) -> str:
         return self.db.setting("tiles", DEFAULT_TILES)
+
+    def new_map(self) -> MapView:
+        mv = MapView(tiles=self.tiles(), view=self.db.setting("map_view", "Map"))
+        mv.view_changed.connect(lambda name: self.db.set_setting("map_view", name))
+        return mv
 
     # -- trips tab ------------------------------------------------------------------
     def _build_trips_tab(self) -> QWidget:
@@ -444,7 +483,7 @@ class MainWindow(QMainWindow):
         self.table.customContextMenuRequested.connect(self.trip_menu)
         self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self.table.selectionModel().selectionChanged.connect(lambda *_: self._trip_selection_changed())
-        self.trip_map = MapView(tiles=self.tiles())
+        self.trip_map = self.new_map()
 
         # Bulk edit bar: set type and/or reason on all selected trips at once.
         self.bulk_label = QLabel()
@@ -476,7 +515,8 @@ class MainWindow(QMainWindow):
         split.addWidget(self.trip_map)
         split.setSizes([480, 360])
         hint = QLabel("Select several trips with Ctrl+click or Shift+click, then set their type and reason above · "
-                      "double-click a cell to edit one trip · right-click for more")
+                      "double-click a cell to edit (a name typed in From/To names that place for all trips) · "
+                      "right-click for more")
         hint.setStyleSheet("color: #777")
         w = QWidget()
         lay = QVBoxLayout(w)
@@ -608,10 +648,14 @@ class MainWindow(QMainWindow):
             m.addAction("Name start location…").triggered.connect(lambda: self.name_location(trips[0], "start"))
             m.addAction("Name end location…").triggered.connect(lambda: self.name_location(trips[0], "end"))
         m.addAction("Look up street addresses").triggered.connect(lambda: self.geocode_trips(trips))
+        m.addAction("Suggest names for unnamed places…").triggered.connect(self.suggest_places)
         m.addSeparator()
         if len(trips) > 1:
             m.addAction("Combine into one trip").triggered.connect(lambda: self.merge(trips))
+        if len(trips) == 1 and trips[0].has_points:
+            m.addAction("Split trip…").triggered.connect(lambda: self.split(trips[0]))
         m.addAction("Export as GPX…").triggered.connect(self.export_gpx)
+        m.addAction("Export as KML…").triggered.connect(self.export_kml)
         m.addSeparator()
         m.addAction(f"Delete {len(trips)} trip(s)").triggered.connect(lambda: self.delete_trips(trips))
         m.exec(self.table.viewport().mapToGlobal(pos))
@@ -636,13 +680,7 @@ class MainWindow(QMainWindow):
                                         text=current)
         if not ok or not name.strip():
             return
-        existing = self.db.nearest_place(lat, lon)
-        if existing:
-            self.db.x("UPDATE place SET name=? WHERE id=?", (name.strip(), existing["id"]))
-        else:
-            self.db.x("INSERT INTO place(name, lat, lon, address) VALUES (?,?,?,?)",
-                      (name.strip(), lat, lon, self.db.cached_address(lat, lon) or ""))
-        self.db.resolve_places()
+        self.db.name_place(lat, lon, name.strip(), t.start_place_id if which == "start" else t.end_place_id)
         self.refresh_trips()
 
     def merge(self, trips: list[Trip]) -> None:
@@ -651,6 +689,19 @@ class MainWindow(QMainWindow):
         except ValueError as e:
             QMessageBox.warning(self, "Combine trips", str(e))
         self.refresh_trips()
+
+    def split(self, t: Trip) -> None:
+        pts = self.db.trip_points(t.id)
+        if len(pts) < 3:
+            QMessageBox.information(self, "Split trip", "This trip has too few GPS points to split.")
+            return
+        d = SplitDialog(self.db, pts, f"{t.start_label()} → {t.end_label()}", self)
+        if d.exec():
+            try:
+                self.db.split_trip(t.id, d.index)
+            except ValueError as e:
+                QMessageBox.warning(self, "Split trip", str(e))
+            self.refresh_trips()
 
     def delete_trips(self, trips: list[Trip]) -> None:
         if QMessageBox.question(self, "Delete trips", f"Delete {len(trips)} trip(s)? This cannot be undone."
@@ -812,6 +863,21 @@ class MainWindow(QMainWindow):
             write_gpx(Path(path), [(f"{t.start_time.astimezone():%Y-%m-%d %H:%M} {t.start_label()} → "
                                     f"{t.end_label()}", self.db.trip_points(t.id)) for t in trips])
 
+    def export_kml(self) -> None:
+        self._write_kml(self.selected_trips() or self.model.trips)
+
+    def _write_kml(self, trips: list[Trip]) -> None:
+        if not trips:
+            return
+        path, _ = QFileDialog.getSaveFileName(self, "Export KML", str(Path.home() / "trips.kml"),
+                                              "Google Earth KML (*.kml)")
+        if path:
+            types = {t["id"]: t["color"] for t in self.db.trip_types()}
+            write_kml(Path(path), [(f"{t.start_time.astimezone():%Y-%m-%d %H:%M} {t.start_label()} → "
+                                    f"{t.end_label()}", types.get(t.trip_type_id, "#cc3333"),
+                                    self.db.trip_points(t.id)) for t in trips if t.has_points])
+            self.statusBar().showMessage(f"Saved {path}", 8000)
+
     def export_csv(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Export CSV", str(Path.home() / "logbook.csv"), "CSV (*.csv)")
         if path:
@@ -821,11 +887,24 @@ class MainWindow(QMainWindow):
         path, _ = QFileDialog.getSaveFileName(self, "Back up database",
                                               str(Path.home() / f"tripbook-{date.today()}.db"), "SQLite (*.db)")
         if path:
-            self.db.conn.commit()
-            dst = sqlite3.connect(path)
-            self.db.conn.backup(dst)
-            dst.close()
+            self.db.backup_to(Path(path))
             self.statusBar().showMessage(f"Backed up to {path}", 8000)
+
+    def restore(self) -> None:
+        start = self.backup_dir if self.backup_dir.exists() else Path.home()
+        path, _ = QFileDialog.getOpenFileName(self, "Restore from backup", str(start), "Tripbook backups (*.db)")
+        if not path or QMessageBox.question(
+                self, "Restore", "Replace all current data with this backup? The current data is backed up to "
+                f"{self.backup_dir} first.") != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            self.db.auto_backup(self.backup_dir, max(int(self.db.setting("backup_keep", "5")), 1) + 1)
+            self.db.restore_from(Path(path))
+        except (OSError, ValueError) as e:
+            QMessageBox.warning(self, "Restore", str(e))
+            return
+        self.statusBar().showMessage(f"Restored {path}", 8000)
+        self.refresh_all()
 
     def open_settings(self) -> None:
         d = SettingsDialog(self.db, self.data_dir, self)
@@ -833,7 +912,7 @@ class MainWindow(QMainWindow):
             old_tiles = self.tiles()
             d.save()
             if self.tiles() != old_tiles:
-                QMessageBox.information(self, "Settings", "The new map tiles are used after restarting Tripbook.")
+                QMessageBox.information(self, "Settings", "The custom map is available after restarting Tripbook.")
             self.apply_period()
 
     # -- places tab -----------------------------------------------------------------
@@ -842,10 +921,11 @@ class MainWindow(QMainWindow):
         self.places_table.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
         self.places_table.itemChanged.connect(self._place_edited)
         self.places_table.itemSelectionChanged.connect(self._place_selected)
-        self.places_map = MapView(tiles=self.tiles())
+        self.places_map = self.new_map()
         self.places_map.clicked.connect(self._map_add_place)
         btns = QHBoxLayout()
-        for text, fn in [("Delete", self.delete_places), ("Look up address", self.geocode_places)]:
+        for text, fn in [("Delete", self.delete_places), ("Look up address", self.geocode_places),
+                         ("Suggest names for unnamed places…", self.suggest_places)]:
             b = QPushButton(text)
             b.clicked.connect(fn)
             btns.addWidget(b)
@@ -898,9 +978,14 @@ class MainWindow(QMainWindow):
     def _map_add_place(self, lat: float, lon: float) -> None:
         name, ok = QInputDialog.getText(self, "Add place", f"Name for the place at {lat:.5f}, {lon:.5f}:")
         if ok and name.strip():
-            self.db.x("INSERT INTO place(name, lat, lon) VALUES (?,?,?)", (name.strip(), lat, lon))
+            self.db.x("INSERT INTO place(name, lat, lon, radius_m) VALUES (?,?,?,?)",
+                      (name.strip(), lat, lon, PLACE_RADIUS_M))
             self.db.resolve_places()
             self.refresh_places()
+
+    def suggest_places(self) -> None:
+        SuggestPlacesDialog(self.db, self).exec()
+        self.refresh_all()
 
     def delete_places(self) -> None:
         ids = selected_ids(self.places_table)
@@ -934,9 +1019,11 @@ class MainWindow(QMainWindow):
 
     # -- rules tab ------------------------------------------------------------------
     def _build_rules_tab(self) -> QWidget:
-        self.rules_table = table_widget(["Vehicle", "From", "To", "Return trip too", "Mark as", "Reason"])
+        self.rules_table = table_widget(["Vehicle", "From", "To", "Return trip too", "Mark as", "Outbound reason",
+                                         "Return reason"])
+        self.rules_table.doubleClicked.connect(lambda _: self.edit_rule())
         btns = QHBoxLayout()
-        for text, fn in [("Add rule…", self.add_rule), ("Delete", self.delete_rules),
+        for text, fn in [("Add rule…", self.add_rule), ("Edit…", self.edit_rule), ("Delete", self.delete_rules),
                          ("Re-apply rules", self.reapply_rules)]:
             b = QPushButton(text)
             b.clicked.connect(fn)
@@ -958,18 +1045,33 @@ class MainWindow(QMainWindow):
                          "JOIN place a ON a.id=r.start_place_id JOIN place b ON b.id=r.end_place_id "
                          "JOIN trip_type t ON t.id=r.trip_type_id ORDER BY a.name")
         fill_table(self.rules_table, [[r["vname"], r["a"], r["b"], "yes" if r["reverse"] else "no", r["tname"],
-                                       r["reason"]] for r in rows], [r["id"] for r in rows])
+                                       r["reason"], (r["reverse_reason"] or r["reason"]) if r["reverse"] else ""]
+                                      for r in rows], [r["id"] for r in rows])
 
     def add_rule(self) -> None:
         if len(self.db.places()) < 1:
             QMessageBox.information(self, "Rules", "Name some places first (right-click a trip → Name start "
                                                    "location, or click on the Places map).")
             return
-        d = RuleDialog(self.db, self)
+        d = RuleDialog(self.db, parent=self)
         if d.exec():
             v = d.values()
-            self.db.x("INSERT INTO rule(vehicle_id, start_place_id, end_place_id, reverse, trip_type_id, reason) "
-                      "VALUES (:vehicle_id, :start_place_id, :end_place_id, :reverse, :trip_type_id, :reason)", v)
+            self.db.x("INSERT INTO rule(vehicle_id, start_place_id, end_place_id, reverse, trip_type_id, reason, "
+                      "reverse_reason) VALUES (:vehicle_id, :start_place_id, :end_place_id, :reverse, :trip_type_id, "
+                      ":reason, :reverse_reason)", v)
+            self.reapply_rules()
+
+    def edit_rule(self) -> None:
+        ids = selected_ids(self.rules_table)
+        if not ids:
+            return
+        d = RuleDialog(self.db, self.db.q("SELECT * FROM rule WHERE id=?", (ids[0],))[0], self)
+        if d.exec():
+            v = d.values()
+            v["id"] = ids[0]
+            self.db.x("UPDATE rule SET vehicle_id=:vehicle_id, start_place_id=:start_place_id, "
+                      "end_place_id=:end_place_id, reverse=:reverse, trip_type_id=:trip_type_id, reason=:reason, "
+                      "reverse_reason=:reverse_reason WHERE id=:id", v)
             self.reapply_rules()
 
     def delete_rules(self) -> None:
@@ -1017,7 +1119,8 @@ class MainWindow(QMainWindow):
         cur = self.db.setting("currency", "€")
         fill_table(self.exp_table, [[r["date"], r["vname"], r["category"], r["description"],
                                      f"{cur}{r['amount']:,.2f}", f"{r['volume']:.2f}" if r["volume"] else "",
-                                     f"{r['odometer']:,.0f}" if r["odometer"] else ""] for r in rows],
+                                     f"{self.db.to_unit(r['odometer']):,.0f}" if r["odometer"] else ""]
+                                    for r in rows],
                    [r["id"] for r in rows])
         total = sum(r["amount"] for r in rows)
         litres = sum(r["volume"] for r in rows)
@@ -1081,9 +1184,10 @@ class MainWindow(QMainWindow):
             if r["repeat_months"]:
                 rep.append(f"every {r['repeat_months']} months")
             if r["repeat_km"]:
-                rep.append(f"every {r['repeat_km']:,.0f} km")
+                rep.append(f"every {self.db.to_unit(r['repeat_km']):,.0f} {self.db.unit}")
             rows.append([status.upper() or "ok", r["vehicle"], r["title"], r["due_date"] or "",
-                         f"{r['due_odometer']:,.0f}" if r["due_odometer"] else "", ", ".join(rep)])
+                         f"{self.db.to_unit(r['due_odometer']):,.0f} {self.db.unit}" if r["due_odometer"] else "",
+                         ", ".join(rep)])
         fill_table(self.rem_table, rows, [r["id"] for r, _ in items])
         colors = {"OVERDUE": "#c0392b", "DUE SOON": "#d68910"}
         for i in range(self.rem_table.rowCount()):
@@ -1097,8 +1201,9 @@ class MainWindow(QMainWindow):
             return
         d = ReminderDialog(self.db, vehicle_id=self.vehicle.currentData(), parent=self)
         if d.exec():
-            self.db.x("INSERT INTO reminder(vehicle_id, title, due_date, due_odometer, repeat_months, repeat_km) "
-                      "VALUES (:vehicle_id, :title, :due_date, :due_odometer, :repeat_months, :repeat_km)", d.values())
+            self.db.x("INSERT INTO reminder(vehicle_id, title, due_date, due_odometer, repeat_months, repeat_km, "
+                      "notice_days, notice_km) VALUES (:vehicle_id, :title, :due_date, :due_odometer, "
+                      ":repeat_months, :repeat_km, :notice_days, :notice_km)", d.values())
             self.refresh_reminders()
 
     def edit_reminder(self) -> None:
@@ -1111,7 +1216,8 @@ class MainWindow(QMainWindow):
             v = d.values()
             v["id"] = ids[0]
             self.db.x("UPDATE reminder SET vehicle_id=:vehicle_id, title=:title, due_date=:due_date, "
-                      "due_odometer=:due_odometer, repeat_months=:repeat_months, repeat_km=:repeat_km WHERE id=:id", v)
+                      "due_odometer=:due_odometer, repeat_months=:repeat_months, repeat_km=:repeat_km, "
+                      "notice_days=:notice_days, notice_km=:notice_km WHERE id=:id", v)
             self.refresh_reminders()
 
     def done_reminder(self) -> None:
@@ -1134,24 +1240,49 @@ class MainWindow(QMainWindow):
     # -- report tab -----------------------------------------------------------------
     def _build_report_tab(self) -> QWidget:
         self.report_view = QTextBrowser()
+        # Report options are settings, so they survive a restart (an issue fixed in Little LogBook 2.4.001).
+        self.report_layout = QComboBox()
+        for key, text in REPORT_LAYOUTS.items():
+            self.report_layout.addItem(text, key)
+        self.report_layout.setCurrentIndex(max(0, self.report_layout.findData(
+            self.db.setting("report_layout", "detailed"))))
+        self.report_expenses = QCheckBox("Include expenses")
+        self.report_expenses.setChecked(self.db.setting("report_expenses", "1") == "1")
+        self.report_layout.currentIndexChanged.connect(self._report_options_changed)
+        self.report_expenses.toggled.connect(self._report_options_changed)
+        opts = QHBoxLayout()
+        opts.addWidget(QLabel("Layout"))
+        opts.addWidget(self.report_layout)
+        opts.addWidget(self.report_expenses)
+        opts.addStretch(1)
+        opts.addWidget(QLabel("The report follows the vehicle, period and type filters above."))
         btns = QHBoxLayout()
         for text, fn in [("Save as PDF…", self.report_pdf), ("Print…", self.report_print),
-                         ("Export CSV…", self.export_csv)]:
+                         ("Export CSV…", self.export_csv), ("Export KML…", self.export_report_kml)]:
             b = QPushButton(text)
             b.clicked.connect(fn)
             btns.addWidget(b)
         btns.addStretch(1)
-        btns.addWidget(QLabel("The report follows the vehicle, period and type filters above."))
         w = QWidget()
         lay = QVBoxLayout(w)
+        lay.addLayout(opts)
         lay.addWidget(self.report_view)
         lay.addLayout(btns)
         return w
 
+    def _report_options_changed(self) -> None:
+        self.db.set_setting("report_layout", self.report_layout.currentData())
+        self.db.set_setting("report_expenses", "1" if self.report_expenses.isChecked() else "0")
+        self.refresh_report()
+
     def _report_html(self) -> str:
         vid = self.vehicle.currentData()
         v = self.db.q("SELECT * FROM vehicle WHERE id=?", (vid,))[0] if vid else None
-        return report_html(self.db, v, self.filtered_trips(), self.filtered_expenses(), self.period_text())
+        return report_html(self.db, v, self.filtered_trips(), self.filtered_expenses(), self.period_text(),
+                           self.report_layout.currentData(), self.report_expenses.isChecked())
+
+    def export_report_kml(self) -> None:
+        self._write_kml(self.filtered_trips())
 
     def refresh_report(self) -> None:
         self.report_view.setHtml(self._report_html())
@@ -1195,6 +1326,14 @@ class MainWindow(QMainWindow):
             btns.addWidget(b)
         btns.addStretch(1)
         self.odo_table = table_widget(["Date", "Odometer reading"])
+        self.rate_table = table_widget(["Vehicle", "Valid from", "Description", "Rate"])
+        self.rate_table.doubleClicked.connect(lambda _: self.edit_rate())
+        rbtns = QHBoxLayout()
+        for text, fn in [("Add rate…", self.add_rate), ("Edit…", self.edit_rate), ("Delete rate", self.delete_rates)]:
+            b = QPushButton(text)
+            b.clicked.connect(fn)
+            rbtns.addWidget(b)
+        rbtns.addStretch(1)
         obtns = QHBoxLayout()
         for text, fn in [("Add reading…", self.add_odometer), ("Delete reading", self.delete_odometer)]:
             b = QPushButton(text)
@@ -1211,6 +1350,10 @@ class MainWindow(QMainWindow):
         lay.addWidget(info)
         lay.addWidget(self.odo_table, 1)
         lay.addLayout(obtns)
+        lay.addWidget(QLabel("<b>Mileage rates</b> – the business mileage claim on reports uses the rate valid on "
+                             "each trip's date"))
+        lay.addWidget(self.rate_table, 1)
+        lay.addLayout(rbtns)
         return w
 
     def refresh_vehicles(self) -> None:
@@ -1226,14 +1369,22 @@ class MainWindow(QMainWindow):
     def refresh_odometers(self) -> None:
         ids = selected_ids(self.veh_table)
         rows = self.db.q("SELECT * FROM odometer WHERE vehicle_id=? ORDER BY date", (ids[0],)) if ids else []
-        fill_table(self.odo_table, [[r["date"], f"{r['reading']:,.0f} km"] for r in rows], [r["id"] for r in rows])
+        fill_table(self.odo_table, [[f"{from_iso(r['date']).astimezone():%Y-%m-%d %H:%M}" if "T" in r["date"]
+                                     else r["date"], f"{self.db.to_unit(r['reading']):,.0f} {self.db.unit}"]
+                                    for r in rows], [r["id"] for r in rows])
+        rates = self.db.q("SELECT m.*, COALESCE(v.name, 'All vehicles') AS vname FROM mileage_rate m "
+                          "LEFT JOIN vehicle v ON v.id=m.vehicle_id ORDER BY m.from_date")
+        cur = self.db.setting("currency", "")
+        fill_table(self.rate_table, [[r["vname"], r["from_date"], r["description"],
+                                      f"{cur}{r['rate'] / self.db.to_unit(1.0):,.4f}/{self.db.unit}"]
+                                     for r in rates], [r["id"] for r in rates])
 
     def add_vehicle(self) -> None:
         d = VehicleDialog(self.db, parent=self)
         if d.exec():
-            self.db.x("INSERT INTO vehicle(name, registration, make, year, odometer_start, odometer_start_date, "
-                      "device_serial, device_password, closed) VALUES (:name, :registration, :make, :year, "
-                      ":odometer_start, :odometer_start_date, :device_serial, :device_password, :closed)", d.values())
+            self.db.x("INSERT INTO vehicle(name, registration, make, year, odometer_start, device_serial, "
+                      "device_password, closed) VALUES (:name, :registration, :make, :year, :odometer_start, "
+                      ":device_serial, :device_password, :closed)", d.values())
             self.refresh_all()
 
     def edit_vehicle(self) -> None:
@@ -1246,8 +1397,7 @@ class MainWindow(QMainWindow):
             v = d.values()
             v["id"] = ids[0]
             self.db.x("UPDATE vehicle SET name=:name, registration=:registration, make=:make, year=:year, "
-                      "odometer_start=:odometer_start, odometer_start_date=:odometer_start_date, "
-                      "device_serial=:device_serial, device_password=:device_password, closed=:closed WHERE id=:id", v)
+                      "odometer_start=:odometer_start, device_serial=:device_serial, device_password=:device_password, closed=:closed WHERE id=:id", v)
             self.refresh_all()
 
     def delete_vehicle(self) -> None:
@@ -1265,12 +1415,35 @@ class MainWindow(QMainWindow):
         if not ids:
             QMessageBox.information(self, "Odometer", "Select a vehicle first.")
             return
-        val, ok = QInputDialog.getDouble(self, "Odometer reading", "Odometer reading today (km):",
-                                         self.db.current_odometer(ids[0]), 0, 9_999_999, 0)
-        if ok:
-            self.db.x("INSERT INTO odometer(vehicle_id, date, reading) VALUES (?,?,?)",
-                      (ids[0], date.today().isoformat(), val))
+        d = OdometerDialog(self.db, self.db.current_odometer(ids[0]), self)
+        if d.exec():
+            when, km = d.values()
+            self.db.x("INSERT INTO odometer(vehicle_id, date, reading) VALUES (?,?,?)", (ids[0], to_iso(when), km))
             self.refresh_vehicles()
+
+    def add_rate(self) -> None:
+        d = MileageRateDialog(self.db, vehicle_id=(selected_ids(self.veh_table) or [None])[0], parent=self)
+        if d.exec():
+            self.db.x("INSERT INTO mileage_rate(vehicle_id, from_date, description, rate) "
+                      "VALUES (:vehicle_id, :from_date, :description, :rate)", d.values())
+            self.refresh_odometers()
+
+    def edit_rate(self) -> None:
+        ids = selected_ids(self.rate_table)
+        if not ids:
+            return
+        d = MileageRateDialog(self.db, self.db.q("SELECT * FROM mileage_rate WHERE id=?", (ids[0],))[0], parent=self)
+        if d.exec():
+            v = d.values()
+            v["id"] = ids[0]
+            self.db.x("UPDATE mileage_rate SET vehicle_id=:vehicle_id, from_date=:from_date, "
+                      "description=:description, rate=:rate WHERE id=:id", v)
+            self.refresh_odometers()
+
+    def delete_rates(self) -> None:
+        for i in selected_ids(self.rate_table):
+            self.db.x("DELETE FROM mileage_rate WHERE id=?", (i,))
+        self.refresh_odometers()
 
     def delete_odometer(self) -> None:
         for i in selected_ids(self.odo_table):
